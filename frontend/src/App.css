@@ -1,0 +1,33 @@
+.container {
+  padding: 40px;
+  background: linear-gradient(135deg, #0f2027, #203a43, #2c5364);
+  color: white;
+  min-height: 100vh;
+  font-family: sans-serif;
+}
+
+.card, .kpi-card {
+  background: rgba(255,255,255,0.1);
+  padding: 20px;
+  margin: 20px 0;
+  border-radius: 15px;
+  backdrop-filter: blur(10px);
+  transition: 0.3s;
+}
+
+.card:hover, .kpi-card:hover {
+  transform: scale(1.02);
+}
+
+.kpi-grid {
+  display: flex;
+  gap: 20px;
+}
+
+.kpi-card h1 {
+  font-size: 32px;
+}
+
+.kpi-card.danger {
+  background: rgba(255, 0, 0, 0.2);
+}
