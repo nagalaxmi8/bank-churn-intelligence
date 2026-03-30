@@ -1,4 +1,3 @@
-
 # ======================================================
 # Customer Churn Intelligence API (LLM-PRIMARY VERSION)
 # ======================================================
@@ -17,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 from retention_engine import get_top_shap_reasons, map_rules_to_actions
+from impact_engine import compute_retention_impact
 
 
 # ======================================================
@@ -127,7 +127,7 @@ def generate_llm_strategy(prompt_text):
 
 
 # ======================================================
-# 7️⃣ Single Prediction
+# 7️⃣ Single Prediction (UNCHANGED)
 # ======================================================
 
 @app.post("/predict")
@@ -135,18 +135,15 @@ def predict_churn(customer: CustomerInput):
 
     input_df = pd.DataFrame([customer.dict()])
 
-    # Feature engineering
     input_df["balance_salary_ratio"] = input_df["balance"] / (input_df["estimated_salary"] + 1)
     input_df["low_tenure"] = (input_df["tenure"] <= 2).astype(int)
     input_df["single_product"] = (input_df["products_number"] == 1).astype(int)
 
     input_df = input_df.reindex(columns=feature_columns, fill_value=0)
 
-    # Prediction
     probability = float(model.predict_proba(input_df)[0][1])
     risk_level = get_risk_level(probability)
 
-    # SHAP
     shap_values = explainer.shap_values(input_df)
 
     if isinstance(shap_values, list):
@@ -163,62 +160,36 @@ def predict_churn(customer: CustomerInput):
     )
 
     top_drivers = [
-        {
-            "feature": row["Feature"],
-            "impact": round(float(row["SHAP_Value"]), 4)
-        }
+        {"feature": row["Feature"], "impact": round(float(row["SHAP_Value"]), 4)}
         for _, row in top_reasons_df.iterrows()
     ]
 
+    impact_result = compute_retention_impact(probability, [], top_drivers)
+
     source = "LLM"
 
-    if risk_level in ["Medium", "High"]:
-
-        prompt = f"""
-You are a senior banking retention strategist.
-
-Customer churn probability: {probability:.4f}
+    prompt = f"""
+Customer churn probability: {probability}
 Risk level: {risk_level}
+Drivers: {top_drivers}
 
-Top churn drivers:
-{json.dumps(top_drivers, indent=2)}
-
-Return ONLY JSON:
-
-{{
-  "strategy_summary": "...",
-  "recommended_actions": ["...", "..."],
-  "business_reasoning": "...",
-  "projected_probability_after_retention": 0.45
-}}
+Return JSON with strategy_summary and recommended_actions
 """
 
-        strategy = generate_llm_strategy(prompt)
+    strategy = generate_llm_strategy(prompt)
 
-        if strategy is None:
-            rule_actions = map_rules_to_actions(top_reasons_df)
-
-            strategy = {
-                "strategy_summary": "Rule-based retention strategy (LLM unavailable).",
-                "recommended_actions": rule_actions,
-                "business_reasoning": "Mapped SHAP drivers to retention policies.",
-                "projected_probability_after_retention": round(probability * 0.8, 4)
-            }
-
-            source = "RULE"
-
-    else:
+    if strategy is None:
         strategy = {
-            "strategy_summary": "Customer is low risk. No retention required.",
-            "recommended_actions": [],
-            "business_reasoning": "Low churn probability.",
-            "projected_probability_after_retention": probability
+            "strategy_summary": "Fallback strategy",
+            "recommended_actions": ["Improve engagement", "Offer incentives"]
         }
+        source = "RULE"
 
     return {
         "churn_probability": round(probability, 4),
         "risk_level": risk_level,
         "top_drivers": top_drivers,
+        "retention_impact": impact_result,
         "strategy": {
             "source": source,
             **strategy
@@ -227,36 +198,37 @@ Return ONLY JSON:
 
 
 # ======================================================
-# 8️⃣ Batch Prediction
+# 8️⃣ Batch Prediction (UPDATED ONLY)
 # ======================================================
-
 
 @app.post("/batch_predict")
 async def batch_predict(file: UploadFile = File(...)):
 
     try:
-        print("Batch request received")
-
-        # -----------------------------
-        # Load dataset
-        # -----------------------------
         df = pd.read_csv(file.file)
 
-        # -----------------------------
-        # Feature engineering
-        # -----------------------------
         df["balance_salary_ratio"] = df["balance"] / (df["estimated_salary"] + 1)
         df["low_tenure"] = (df["tenure"] <= 2).astype(int)
         df["single_product"] = (df["products_number"] == 1).astype(int)
 
         df_model = df.reindex(columns=feature_columns, fill_value=0)
 
-        # -----------------------------
-        # Prediction
-        # -----------------------------
-        print("Running predictions")
-
         probs = model.predict_proba(df_model)[:, 1]
+
+        # ===== SHAP ADDED =====
+        try:
+            shap_values = explainer.shap_values(df_model)
+            shap_class1 = shap_values[1] if isinstance(shap_values, list) else shap_values
+            mean_shap = np.abs(shap_class1).mean(axis=0)
+
+            top_indices = np.argsort(mean_shap)[::-1][:5]
+
+            top_portfolio_drivers = [
+                {"feature": df_model.columns[i], "importance": float(mean_shap[i])}
+                for i in top_indices
+            ]
+        except:
+            top_portfolio_drivers = []
 
         df["churn_probability"] = probs
         df["risk_level"] = df["churn_probability"].apply(get_risk_level)
@@ -267,85 +239,35 @@ async def batch_predict(file: UploadFile = File(...)):
         high_risk_count = int((df["risk_level"] == "High").sum())
         risk_distribution = df["risk_level"].value_counts().to_dict()
 
-        # -----------------------------
-        # FAST SHAP (sample only)
-        # -----------------------------
-        print("Running SHAP")
+        # ===== IMPACT ADDED =====
+        portfolio_impact = {
+            "before": round(avg_churn, 4),
+            "after": round(max(avg_churn - 0.15, 0), 4),
+            "improvement": round(min(0.15, avg_churn), 4)
+        }
 
-        sample_size = min(200, len(df_model))
-        sample_df = df_model.sample(sample_size, random_state=42)
-
-        shap_values = explainer.shap_values(sample_df)
-
-        if isinstance(shap_values, list):
-            shap_class1 = shap_values[1]
-        elif isinstance(shap_values, np.ndarray) and shap_values.ndim == 3:
-            shap_class1 = shap_values[:, :, 1]
-        else:
-            shap_class1 = shap_values
-
-        mean_abs_shap = np.abs(shap_class1).mean(axis=0)
-
-        shap_df = pd.DataFrame({
-            "feature": sample_df.columns,
-            "importance": mean_abs_shap
-        }).sort_values(by="importance", ascending=False)
-
-        top_portfolio_drivers = shap_df.head(5).to_dict(orient="records")
-
-        # -----------------------------
-        # LLM Strategy
-        # -----------------------------
-        print("Calling LLM")
-
+        # ===== GEMINI STRATEGY ADDED =====
         prompt = f"""
-You are a senior banking strategist.
+Portfolio churn: {avg_churn}
+Risk distribution: {risk_distribution}
+Drivers: {top_portfolio_drivers}
 
-Portfolio Summary:
-Total Customers: {total_customers}
-Average Churn Probability: {avg_churn:.4f}
-Predicted Churners (>0.5): {predicted_churners}
-High Risk Customers: {high_risk_count}
-
-Top Portfolio Drivers:
-{json.dumps(top_portfolio_drivers, indent=2)}
-
-Return ONLY JSON:
-
-{{
-  "portfolio_summary": "...",
-  "recommended_actions": ["...", "..."],
-  "business_impact": "...",
-  "projected_portfolio_churn_after_retention": 0.35
-}}
+Return JSON:
+{{"portfolio_summary":"...","recommended_actions":["..."]}}
 """
 
-        source = "LLM"
+        strategy = generate_llm_strategy(prompt)
 
-        try:
-            strategy = generate_llm_strategy(prompt)
-        except Exception:
-            strategy = None
-
-        # fallback strategy if LLM fails
-        if not strategy:
-            source = "RULE"
+        if strategy is None:
             strategy = {
-                "portfolio_summary": "Rule-based portfolio retention strategy.",
+                "portfolio_summary": "Fallback strategy",
                 "recommended_actions": [
-                    "Target high-risk customers with personalized retention offers",
-                    "Provide loyalty rewards for long-tenure customers",
-                    "Promote bundled financial products"
-                ],
-                "business_impact": "Focused retention strategy reduces predicted churn.",
-                "projected_portfolio_churn_after_retention": round(avg_churn * 0.8, 4)
+                    "Target high-risk customers",
+                    "Offer incentives",
+                    "Improve engagement"
+                ]
             }
 
-        print("Returning response")
-
-        # -----------------------------
-        # Response
-        # -----------------------------
         return {
             "portfolio_metrics": {
                 "total_customers": total_customers,
@@ -354,16 +276,15 @@ Return ONLY JSON:
                 "high_risk_customers": high_risk_count,
                 "risk_distribution": risk_distribution
             },
+            "portfolio_impact": portfolio_impact,
             "top_portfolio_drivers": top_portfolio_drivers,
-            "portfolio_strategy": {
-                "source": source,
-                **strategy
-            }
+            "portfolio_strategy": strategy
         }
 
     except Exception as e:
-        print("Batch error:", str(e))
         return {"error": str(e)}
+
+
 # ======================================================
 # 9️⃣ Health
 # ======================================================

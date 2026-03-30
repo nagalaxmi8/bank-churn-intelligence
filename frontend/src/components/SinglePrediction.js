@@ -63,9 +63,9 @@ export default function SinglePrediction() {
           <ShapChart drivers={result.top_drivers} />
 
           <RetentionComparisonChart
-            before={result.churn_probability}
-            after={result.strategy.projected_probability_after_retention}
-          />
+            before={result.retention_impact.before}
+            after={result.retention_impact.after} />
+
 
           <StrategyPanel strategy={result.strategy} />
         </>
